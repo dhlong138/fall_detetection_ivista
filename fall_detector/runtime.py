@@ -21,6 +21,7 @@ import numpy as np
 
 from .pose import DetectionResult, Keypoint, Tracker, UltralyticsPoseEstimator
 from .capture import LatestFrameCapture
+from .llm_verifier import FallLLMVerifier
 from .settings import CONFIG, DEFAULT_CAMERA_URL, DEFAULT_STORAGE_BASE_PATH
 
 from realtime_ai_publisher import (
@@ -1120,6 +1121,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--publish-missing-hold-frames", type=int, default=20, help="Keep publishing the last bbox for this many missed detection frames to avoid UI flicker.")
     parser.add_argument("--suppress-empty-publish-frames", type=int, default=0, help="Do not publish empty ai_results for this many consecutive objectless frames.")
     parser.add_argument("--fall-hold-frames", type=int, default=300, help="Keep publishing a FALL alert for this many frames after the model first detects a fall.")
+    parser.add_argument("--fall-llm-verify", action=argparse.BooleanOptionalAction, default=False, help="Require an asynchronous visual LLM confirmation before publishing FALL/blacklist metadata.")
+    parser.add_argument("--fall-llm-api-url", default=os.getenv("FALL_LLM_API_URL", "http://pub.ioit.science:13609/v1"), help="OpenAI-compatible LLM API base URL used for fall verification.")
+    parser.add_argument("--fall-llm-api-key", default=os.getenv("FALL_LLM_API_KEY", ""), help="LLM API key. Prefer the FALL_LLM_API_KEY environment variable.")
+    parser.add_argument("--fall-llm-model", default=os.getenv("FALL_LLM_MODEL", "google/gemma-4-26B-A4B-it"), help="Vision-capable model used to verify a fall.")
+    parser.add_argument("--fall-llm-timeout", type=float, default=float(os.getenv("FALL_LLM_TIMEOUT", "30")), help="Seconds before a fall-verification request is rejected.")
+    parser.add_argument("--fall-llm-workers", type=int, default=int(os.getenv("FALL_LLM_WORKERS", "2")), help="Maximum concurrent fall-verification requests.")
+    parser.add_argument("--fall-llm-image-max-width", type=int, default=int(os.getenv("FALL_LLM_IMAGE_MAX_WIDTH", "1280")), help="Maximum JPEG width submitted to the LLM. Use 0 for original width.")
+    parser.add_argument("--fall-llm-jpeg-quality", type=int, default=int(os.getenv("FALL_LLM_JPEG_QUALITY", "85")), help="JPEG quality for the image submitted to the LLM.")
     parser.add_argument("--force-fall-alert", action=argparse.BooleanOptionalAction, default=False, help="Publish every detected person as a falling blacklist alert for UI integration testing.")
     parser.add_argument("--fall-probe-log-threshold", type=float, default=1.01, help="Log non-fall probe metrics only when fall_score is at or above this value. Use 0.25 for verbose debugging.")
     parser.add_argument("--publish-sample-resource", action=argparse.BooleanOptionalAction, default=True, help="Save the first camera frame using the sample storage layout and attach image_path/asset_id.")
@@ -1133,6 +1142,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--publish-meta-type", default=os.getenv("PUBLISH_META_TYPE", DEFAULT_META_TYPE), help="meta_type for each bbox. Defaults to the working sample value.")
     parser.add_argument("--service-instance-id", default=os.getenv("SERVICE_INSTANCE_ID"), help="Optional stable service instance id.")
     args = parser.parse_args()
+    if args.fall_llm_verify and not args.fall_llm_api_key:
+        parser.error("--fall-llm-verify requires --fall-llm-api-key or FALL_LLM_API_KEY")
     if args.video:
         args.url = args.video
     elif not args.url:
@@ -1242,6 +1253,19 @@ def main() -> None:
             for item in items
         )
 
+    fall_llm_verifier: FallLLMVerifier | None = None
+    if args.fall_llm_verify:
+        fall_llm_verifier = FallLLMVerifier(
+            api_url=args.fall_llm_api_url,
+            api_key=args.fall_llm_api_key,
+            model=args.fall_llm_model,
+            timeout_seconds=max(1.0, float(args.fall_llm_timeout)),
+            max_workers=max(1, int(args.fall_llm_workers)),
+            image_max_width=max(0, int(args.fall_llm_image_max_width)),
+            jpeg_quality=min(100, max(1, int(args.fall_llm_jpeg_quality))),
+        )
+        logging.info("LLM fall verification enabled: url=%s model=%s workers=%s", args.fall_llm_api_url, args.fall_llm_model, args.fall_llm_workers)
+
     def publish_fall_object_ids(
         items: list[tuple[DetectionResult, BodyGeometry, FeatureVector]],
     ) -> set[int]:
@@ -1336,6 +1360,26 @@ def main() -> None:
 
     try:
         while True:
+            llm_result_image_path = ""
+            llm_result_asset_id: str | None = None
+            if fall_llm_verifier is not None:
+                for result in fall_llm_verifier.drain_results():
+                    if not result.confirmed:
+                        logging.warning("LLM rejected fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
+                        continue
+                    try:
+                        llm_result_image_path, llm_result_asset_id = prepare_publish_resource(
+                            result.frame,
+                            "LLM-confirmed fall",
+                            result.frame_index,
+                        )
+                        publish_image_path = llm_result_image_path
+                        publish_asset_id = llm_result_asset_id
+                        logging.warning("LLM confirmed fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
+                    except Exception:
+                        logging.exception("Cannot prepare image for LLM-confirmed fall; suppressing fall alert")
+                        # A FALL without its verified image must not pass the LLM gate.
+                        fall_llm_verifier.invalidate(result.track_id)
             ok, frame, last_capture_seq = cap.read_latest(last_capture_seq)
             if not ok:
                 if cap.is_finished():
@@ -1436,6 +1480,8 @@ def main() -> None:
                 if current_state == "FALL":
                     setattr(feature, "state_event", "falling")
                 setattr(feature, "fall_started", current_state == "FALL" and previous_state != "FALL")
+                if fall_llm_verifier is not None and current_state == "FALL":
+                    fall_llm_verifier.submit(track_id, frame_index, frame)
                 # The dashboard creates and moves a box only from object_update.
                 # Respect the CLI controls for ordinary people as well as FALL;
                 # previously these options were parsed but never applied here.
@@ -1448,7 +1494,11 @@ def main() -> None:
                 person.last_publish_item = (detection, geometry, feature)
                 if args.display:
                     display_items.append((detection, geometry, feature))
-                if publisher is not None:
+                if publisher is not None and (
+                    current_state != "FALL"
+                    or fall_llm_verifier is None
+                    or fall_llm_verifier.is_approved(track_id)
+                ):
                     publish_items.append((detection, geometry, feature))
                 if feature.state == "FALL":
                     logging.warning("FALL detected: track=%s score=%.2f frame=%s", track_id, feature.fall_score, frame_index)
@@ -1497,15 +1547,44 @@ def main() -> None:
                             setattr(feature, "event_type", "object_exist")
                         if args.display:
                             display_items.append((detection, geometry, feature))
-                        if publisher is not None:
+                        if publisher is not None and (
+                            feature.state != "FALL"
+                            or fall_llm_verifier is None
+                            or fall_llm_verifier.is_approved(track_id)
+                        ):
                             publish_items.append((detection, geometry, feature))
                             held_publish_ids.append(track_id)
+
+            if fall_llm_verifier is not None:
+                fall_llm_verifier.forget_inactive(
+                    {
+                        track_id
+                        for track_id, person in persons.items()
+                        if person.current_state == "FALL" or person.fall_hold_remaining > 0
+                    }
+                )
 
             publish_every_n = max(1, int(args.publish_every_n))
             if publisher is not None and frame_index % publish_every_n == 0:
                 if not publish_items:
                     active_fall_publish_ids = set()
                     consecutive_empty_publish_frames += 1
+                    llm_unapproved_fall_active = (
+                        fall_llm_verifier is not None
+                        and any(
+                            (person.current_state == "FALL" or person.fall_hold_remaining > 0)
+                            and not fall_llm_verifier.is_approved(track_id)
+                            for track_id, person in persons.items()
+                        )
+                    )
+                    if llm_unapproved_fall_active:
+                        # Do not emit an empty Kafka record while the only detected alert is
+                        # awaiting/rejected by the independent LLM verification pipeline.
+                        if args.publish_debug_objects:
+                            logging.info("Suppressing unverified FALL metadata: frame=%s", frame_index)
+                        frame_index += 1
+                        stats_processed += 1
+                        continue
                     if consecutive_empty_publish_frames <= max(0, int(args.suppress_empty_publish_frames)):
                         if args.publish_debug_objects:
                             logging.info(
@@ -1528,16 +1607,16 @@ def main() -> None:
                 fall_object_ids = publish_fall_object_ids(publish_items)
                 new_fall_object_ids = fall_object_ids - active_fall_publish_ids
                 active_fall_publish_ids = fall_object_ids
-                if args.publish_sample_resource and not sample_resource_ready:
+                if args.publish_sample_resource and fall_llm_verifier is None and not sample_resource_ready:
                     try:
                         publish_image_path, publish_asset_id = prepare_publish_resource(frame, "Sample", frame_index)
                         sample_resource_ready = True
                     except Exception:
                         sample_resource_ready = True
                         logging.exception("Cannot prepare sample-style image resource; publishing metadata without asset_id")
-                message_image_path = publish_image_path
-                message_asset_id = publish_asset_id if frame_index == 0 else None
-                if new_fall_object_ids and args.publish_sample_resource:
+                message_image_path = llm_result_image_path or publish_image_path
+                message_asset_id = llm_result_asset_id or (publish_asset_id if frame_index == 0 else None)
+                if new_fall_object_ids and args.publish_sample_resource and fall_llm_verifier is None:
                     try:
                         message_image_path, message_asset_id = prepare_publish_resource(frame, "Fall", frame_index)
                     except Exception:
@@ -1653,6 +1732,8 @@ def main() -> None:
             repeat_publish_thread.join(timeout=2.0)
         if publisher is not None:
             publisher.close()
+        if fall_llm_verifier is not None:
+            fall_llm_verifier.close()
         cap.release()
         if args.display:
             cv2.destroyAllWindows()
