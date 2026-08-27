@@ -1376,7 +1376,10 @@ def main() -> None:
             if fall_llm_verifier is not None:
                 for result in fall_llm_verifier.drain_results():
                     if not result.confirmed:
-                        logging.warning("LLM rejected fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
+                        if result.reason.startswith("LLM verification failed:"):
+                            logging.warning("LLM fall verification failed: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
+                        else:
+                            logging.debug("LLM rejected fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
                         continue
                     try:
                         llm_result_image_path, llm_result_asset_id = prepare_publish_resource(
@@ -1511,8 +1514,10 @@ def main() -> None:
                     or fall_llm_verifier.is_approved(track_id)
                 ):
                     publish_items.append((detection, geometry, feature))
-                if feature.state == "FALL":
+                if feature.state == "FALL" and fall_llm_verifier is None:
                     logging.warning("FALL detected: track=%s score=%.2f frame=%s", track_id, feature.fall_score, frame_index)
+                elif feature.state == "FALL":
+                    logging.debug("Raw FALL awaiting/after LLM gate: track=%s frame=%s", track_id, frame_index)
                 elif feature.state != "NORMAL" or feature.fall_score >= float(args.fall_probe_log_threshold):
                     logging.info(
                         "Fall probe: track=%s state=%s score=%.2f angle=%s aspect=%s valid=%s reason=%s frame=%s",
