@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -1143,7 +1144,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--service-instance-id", default=os.getenv("SERVICE_INSTANCE_ID"), help="Optional stable service instance id.")
     args = parser.parse_args()
     if args.fall_llm_verify and not args.fall_llm_api_key:
-        parser.error("--fall-llm-verify requires --fall-llm-api-key or FALL_LLM_API_KEY")
+        sample_path = Path(__file__).resolve().parent.parent / "call_llm_sample.txt"
+        try:
+            sample_text = sample_path.read_text(encoding="utf-8-sig")
+            match = re.search(r"Authorization:\\s*Bearer\\s+([^\"'`\\s]+)", sample_text, flags=re.IGNORECASE)
+            if match:
+                args.fall_llm_api_key = match.group(1)
+                logging.info("Using fall LLM API key from %s", sample_path.name)
+        except OSError:
+            pass
+    if args.fall_llm_verify and not args.fall_llm_api_key:
+        parser.error("--fall-llm-verify requires --fall-llm-api-key, FALL_LLM_API_KEY, or a valid call_llm_sample.txt")
     if args.video:
         args.url = args.video
     elif not args.url:
