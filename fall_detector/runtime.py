@@ -1147,7 +1147,7 @@ def parse_args() -> argparse.Namespace:
         sample_path = Path(__file__).resolve().parent.parent / "call_llm_sample.txt"
         try:
             sample_text = sample_path.read_text(encoding="utf-8-sig")
-            match = re.search(r"Authorization:\\s*Bearer\\s+([^\"'`\\s]+)", sample_text, flags=re.IGNORECASE)
+            match = re.search(r"Authorization:\s*Bearer\s+([^\"'`\s]+)", sample_text, flags=re.IGNORECASE)
             if match:
                 args.fall_llm_api_key = match.group(1)
                 logging.info("Using fall LLM API key from %s", sample_path.name)
