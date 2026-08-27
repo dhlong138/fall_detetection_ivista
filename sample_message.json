@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "message_id": "817df61a-8ec1-4946-99c0-f0cd16b449d0",
+  "server_id": "NODE1",
+  "cam_id": "CAM_VP_1",
+  "frame_num": 0,
+  "ntp_timestamp": 123,
+  "produced_at": "2026-08-21T04:41:51.908857Z",
+  "image": {
+    "width": 1920,
+    "height": 1080,
+    "image_path": "server_assets/V3SStorage/images/x.jpg",
+    "asset_id": "asset-sample"
+  },
+  "frame_analysis": {
+    "counts": {
+      "per_class": {}
+    },
+    "roi_overcrowded": {},
+    "events": []
+  },
+  "ai_results": [
+    {
+      "id": "0df2011f-5eb2-4860-a407-572eb6dfad0f",
+      "meta_type": "person",
+      "tracking_object_id": 436166524,
+      "bbox": {
+        "left": 200,
+        "top": 100,
+        "width": 300,
+        "height": 220
+      },
+      "is_blacklist": true,
+      "detected_object_ids": "person falling",
+      "name": "",
+      "event_type": "object_update",
+      "confidence": 1.0,
+      "object_key": 436166524,
+      "global_object_id": "dce48133-1545-4e78-adde-7b27158bffa5:CAM_VP_1:436166524",
+      "object_analysis": [
+        {
+          "type": "object_analysis",
+          "object_key": 436166524,
+          "last_pos": [
+            350,
+            320
+          ]
+        }
+      ],
+      "placeholder": {}
+    }
+  ],
+  "service_instance_id": "svc"
+}

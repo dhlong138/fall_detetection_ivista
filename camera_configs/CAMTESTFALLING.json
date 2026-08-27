@@ -1,0 +1,10 @@
+{
+  "url": "rtsp://admin:ivista@192.168.1.199:8559/live/CAMTESTFALLING/main",
+  "cam_id": "CAMTESTFALLING",
+  "kafka_bootstrap_servers": "192.168.1.199:29092",
+  "model": "yolo11x-pose.engine",
+  "device": "cuda",
+  "reconnect_delay": 0.2,
+  "publish_object_update_frames": 300,
+  "publish_missing_hold_frames": 30
+}

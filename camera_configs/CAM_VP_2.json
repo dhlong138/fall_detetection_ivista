@@ -1,0 +1,12 @@
+{
+  "url": "rtsp://admin:ivista@192.168.1.199:8559/live/CAM_VP_2/main",
+  "cam_id": "CAM_VP_2",
+  "kafka_bootstrap_servers": "192.168.1.199:29092",
+  "model": "yolo11x-pose.engine",
+  "device": "cuda",
+  "process_width": 960,
+  "reconnect_delay": 2.0,
+  "publish_object_update_frames": 300,
+  "publish_missing_hold_frames": 20,
+  "publish_result_id_mode": "uuid"
+}

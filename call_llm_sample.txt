@@ -1,0 +1,4 @@
+curl.exe -X POST http://pub.ioit.science:13609/v1/chat/completions `
+-H "Authorization: Bearer pdrSlqBijkkUuWZMcU/k2iZdDQVmrRZ2fnVbV2GH8Pg=" `
+-H "Content-Type: application/json" `
+-d '{\"model\": \"google/gemma-4-26B-A4B-it\", \"messages\": [{\"role\": \"user\", \"content\": \"Xin chào! Bạn là mô hình ngôn ngữ nào và được phát triển bởi ai?\"}]}

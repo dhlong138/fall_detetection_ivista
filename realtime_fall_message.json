@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "message_id": "7693e020-77c1-412d-bdc4-fb68d7bfb836",
+  "server_id": "NODE1",
+  "cam_id": "CAM_VP_1",
+  "frame_num": 0,
+  "ntp_timestamp": 1787287311908857000,
+  "produced_at": "2026-08-21T04:41:51.908857Z",
+  "image": {
+    "width": 1920,
+    "height": 1080,
+    "image_path": "server_assets/V3SStorage/images/x.jpg",
+    "asset_id": "asset-sample"
+  },
+  "frame_analysis": {
+    "counts": {
+      "per_class": {
+        "person": 1
+      },
+      "per_signal": {
+        "fall": 1
+      }
+    },
+    "roi_overcrowded": {},
+    "events": [
+      {
+        "event_type": "object_update",
+        "signal": "fall",
+        "status": "fall",
+        "label": "fall",
+        "color": "#FF1744",
+        "color_rgb": [
+          255,
+          23,
+          68
+        ],
+        "tracking_object_id": 101,
+        "object_key": 101,
+        "confidence": 0.94
+      }
+    ]
+  },
+  "ai_results": [
+    {
+      "id": "d3fadfa8-9f52-42ac-a38b-d382ed46c708",
+      "meta_type": "person",
+      "tracking_object_id": 101,
+      "bbox": {
+        "left": 420,
+        "top": 145,
+        "width": 260,
+        "height": 665
+      },
+      "is_blacklist": true,
+      "detected_object_ids": "person falling",
+      "name": "fall",
+      "event_type": "object_update",
+      "confidence": 0.94,
+      "object_key": 101,
+      "global_object_id": "svc:CAM_VP_1:101",
+      "object_analysis": [
+        {
+          "type": "object_analysis",
+          "object_key": 101,
+          "last_pos": [
+            550,
+            478
+          ],
+          "state": "FALL",
+          "signal": "fall",
+          "label": "fall",
+          "color": "#FF1744",
+          "color_rgb": [
+            255,
+            23,
+            68
+          ],
+          "metrics": {
+            "body_angle": 12.5,
+            "aspect_ratio": 2.56,
+            "speed": 0.14,
+            "acceleration": 0.03,
+            "vertical_velocity": 0.1,
+            "vertical_acceleration": 0.02,
+            "body_core_width": 145.0,
+            "body_core_height": 430.0,
+            "pose_confidence": 0.94,
+            "fall_score": 0.91,
+            "valid_pose": true
+          },
+          "keypoints": [
+            {
+              "name": "nose",
+              "x": 530.0,
+              "y": 180.0,
+              "confidence": 0.88
+            },
+            {
+              "name": "left_shoulder",
+              "x": 480.0,
+              "y": 280.0,
+              "confidence": 0.91
+            },
+            {
+              "name": "right_shoulder",
+              "x": 590.0,
+              "y": 285.0,
+              "confidence": 0.9
+            },
+            {
+              "name": "left_hip",
+              "x": 500.0,
+              "y": 480.0,
+              "confidence": 0.86
+            },
+            {
+              "name": "right_hip",
+              "x": 585.0,
+              "y": 485.0,
+              "confidence": 0.84
+            },
+            {
+              "name": "left_ankle",
+              "x": 505.0,
+              "y": 770.0,
+              "confidence": 0.76
+            },
+            {
+              "name": "right_ankle",
+              "x": 585.0,
+              "y": 775.0,
+              "confidence": 0.78
+            }
+          ]
+        }
+      ],
+      "placeholder": {
+        "display": {
+          "label": "fall",
+          "color": "#FF1744",
+          "color_rgb": [
+            255,
+            23,
+            68
+          ]
+        }
+      },
+      "object_type": "person",
+      "signal": "fall",
+      "label": "fall",
+      "display_label": "fall",
+      "color": "#FF1744",
+      "color_rgb": [
+        255,
+        23,
+        68
+      ],
+      "status": "fall",
+      "state_event": "falling"
+    }
+  ],
+  "service_instance_id": "svc"
+}
