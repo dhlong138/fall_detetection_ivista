@@ -15,11 +15,11 @@
   },
   "llm_verification": {
     "system_prompt": "You verify CCTV fall alerts. Respond with JSON only: {\"is_fall\":true|false,\"reason\":\"short reason\"}. Set is_fall true only when the person is visibly falling or lying on the ground in a way consistent with a real fall.",
-    "context_frames": 90,
+    "context_frames": 450,
     "context_iou_threshold": 0.15,
     "context_center_distance_ratio": 0.6,
-    "context_match_same_track": true,
+    "context_match_same_track": false,
     "temporal_context_frames": 15,
-    "confirmed_event_lock_frames": 90
+    "confirmed_event_lock_frames": 0
   }
 }

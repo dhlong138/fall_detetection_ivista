@@ -553,6 +553,34 @@ class PersonState:
         return values[-n:] if n else values
 
 
+@dataclass
+class ConfirmedFallContext:
+    """One recent verified fall kept only for short, two-image LLM checks."""
+
+    frame_index: int
+    track_id: int
+    bbox: tuple[float, float, float, float] | None
+    frame: np.ndarray
+
+
+@dataclass(frozen=True)
+class ConfirmedEventLock:
+    """A short post-confirmation deduplication lock for one real-world fall."""
+
+    frame_index: int
+    track_id: int
+    bbox: tuple[float, float, float, float] | None
+
+
+@dataclass
+class PendingTemporalFallCheck:
+    track_id: int
+    frame_index: int
+    bbox: tuple[float, float, float, float]
+    before_frame: np.ndarray
+    candidate_frame: np.ndarray
+
+
 class RuleBasedFallClassifier:
     def __init__(self, config: dict[str, Any]) -> None:
         self.cfg = config["fall_detection"]
@@ -1214,7 +1242,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fall-llm-workers", type=int, default=int(os.getenv("FALL_LLM_WORKERS", "2")), help="Maximum concurrent fall-verification requests.")
     parser.add_argument("--fall-llm-image-max-width", type=int, default=int(os.getenv("FALL_LLM_IMAGE_MAX_WIDTH", "1280")), help="Maximum JPEG width submitted to the LLM. Use 0 for original width.")
     parser.add_argument("--fall-llm-jpeg-quality", type=int, default=int(os.getenv("FALL_LLM_JPEG_QUALITY", "85")), help="JPEG quality for the image submitted to the LLM.")
-    parser.add_argument("--fall-llm-retry-frames", type=int, default=30, help="Retry a rejected LLM fall check after this many frames while the person remains in FALL.")
+    parser.add_argument("--fall-llm-retry-frames", type=int, default=30, help="Retry an LLM transport failure after this many frames while the person remains in FALL; semantic yes/no decisions are once per FALL episode.")
     parser.add_argument("--fall-crops-dir", default="output_fall_crops", help="Directory for crops confirmed by the fall LLM.")
     parser.add_argument("--force-fall-alert", action=argparse.BooleanOptionalAction, default=False, help="Publish every detected person as a falling blacklist alert for UI integration testing.")
     parser.add_argument("--fall-probe-log-threshold", type=float, default=1.01, help="Log non-fall probe metrics only when fall_score is at or above this value. Use 0.25 for verbose debugging.")
@@ -1346,6 +1374,21 @@ def main() -> None:
     latest_publish_image_path = ""
     latest_publish_asset_id: str | None = None
     active_fall_publish_ids: set[int] = set()
+    llm_context_config = runtime_config.get("llm_verification", {})
+    llm_context_frames = max(0, int(llm_context_config.get("context_frames", 0)))
+    llm_context_iou = max(0.0, float(llm_context_config.get("context_iou_threshold", 0.15)))
+    llm_context_center_ratio = max(0.0, float(llm_context_config.get("context_center_distance_ratio", 0.6)))
+    llm_context_match_same_track = bool(llm_context_config.get("context_match_same_track", False))
+    llm_temporal_frames = max(0, int(llm_context_config.get("temporal_context_frames", 0)))
+    confirmed_event_lock_frames = max(0, int(llm_context_config.get("confirmed_event_lock_frames", 0)))
+    confirmed_fall_contexts: deque[ConfirmedFallContext] = deque()
+    confirmed_event_locks: deque[ConfirmedEventLock] = deque()
+    # A confirmation is emitted once, then the lock suppresses all later
+    # metadata for that same physical fall.  Video drawing deliberately does
+    # not consult this set so raw detector boxes remain observable.
+    pending_confirmed_alert_track_ids: set[int] = set()
+    temporal_frame_history: deque[tuple[int, np.ndarray]] = deque(maxlen=max(2, llm_temporal_frames + 1))
+    pending_temporal_fall_checks: dict[int, PendingTemporalFallCheck] = {}
     repeat_publish_stop = threading.Event()
     repeat_publish_thread: threading.Thread | None = None
     repeat_publish_frame_index = 0
@@ -1356,6 +1399,31 @@ def main() -> None:
             or str(getattr(item[2], "state", "") or "") == "FALL"
             for item in items
         )
+
+    def confirmed_event_lock_for(
+        track_id: int,
+        bbox: tuple[float, float, float, float] | None,
+        check_frame_index: int,
+    ) -> ConfirmedEventLock | None:
+        """Find an active lock by logical ID, or a nearby box after an ID switch."""
+        if confirmed_event_lock_frames <= 0:
+            return None
+        while (
+            confirmed_event_locks
+            and check_frame_index > confirmed_event_locks[0].frame_index + confirmed_event_lock_frames
+        ):
+            confirmed_event_locks.popleft()
+        for lock in reversed(confirmed_event_locks):
+            if track_id == lock.track_id:
+                return lock
+            if bbox is None or lock.bbox is None:
+                continue
+            if (
+                bbox_iou(bbox, lock.bbox) >= llm_context_iou
+                or bbox_center_distance_ratio(bbox, lock.bbox) <= llm_context_center_ratio
+            ):
+                return lock
+        return None
 
     fall_llm_verifier: FallLLMVerifier | None = None
     if args.fall_llm_verify:
@@ -1368,6 +1436,7 @@ def main() -> None:
             image_max_width=max(0, int(args.fall_llm_image_max_width)),
             jpeg_quality=min(100, max(1, int(args.fall_llm_jpeg_quality))),
             retry_after_frames=max(1, int(args.fall_llm_retry_frames)),
+            system_prompt=str(runtime_config.get("llm_verification", {}).get("system_prompt", "")),
         )
         logging.info("LLM fall verification enabled: url=%s model=%s workers=%s", args.fall_llm_api_url, args.fall_llm_model, args.fall_llm_workers)
 
@@ -1475,6 +1544,17 @@ def main() -> None:
                         else:
                             logging.debug("LLM rejected fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
                         continue
+                    duplicate_lock = confirmed_event_lock_for(result.track_id, result.bbox, frame_index)
+                    if duplicate_lock is not None:
+                        logging.info(
+                            "Suppressing duplicate LLM-confirmed fall: track=%s frame=%s locked_track=%s locked_frame=%s",
+                            result.track_id,
+                            result.frame_index,
+                            duplicate_lock.track_id,
+                            duplicate_lock.frame_index,
+                        )
+                        fall_llm_verifier.invalidate(result.track_id)
+                        continue
                     try:
                         confirmed_crop = save_fall_crop(
                             result.frame,
@@ -1490,6 +1570,27 @@ def main() -> None:
                         )
                         publish_image_path = llm_result_image_path
                         publish_asset_id = llm_result_asset_id
+                        pending_confirmed_alert_track_ids.add(result.track_id)
+                        if confirmed_event_lock_frames > 0:
+                            confirmed_event_locks.append(
+                                ConfirmedEventLock(
+                                    # This is deliberately the frame where the LLM answer
+                                    # arrived, not the earlier candidate frame.  A slow
+                                    # answer must still start a full post-confirmation lock.
+                                    frame_index=frame_index,
+                                    track_id=result.track_id,
+                                    bbox=result.bbox,
+                                )
+                            )
+                        if llm_context_frames > 0:
+                            confirmed_fall_contexts.append(
+                                ConfirmedFallContext(
+                                    frame_index=result.frame_index,
+                                    track_id=result.track_id,
+                                    bbox=result.bbox,
+                                    frame=result.frame.copy(),
+                                )
+                            )
                         logging.warning("LLM confirmed fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
                     except Exception:
                         logging.exception("Cannot prepare image for LLM-confirmed fall; suppressing fall alert")
@@ -1510,6 +1611,8 @@ def main() -> None:
                 raw_to_logical_track_id.clear()
                 logical_last_bbox.clear()
                 active_fall_publish_ids.clear()
+                confirmed_event_locks.clear()
+                pending_confirmed_alert_track_ids.clear()
                 next_logical_track_id = 1
                 last_capture_loop_generation = current_loop_generation
                 logging.info("Video loop boundary: reset tracker and fall state (loop=%s).", current_loop_generation)
@@ -1519,6 +1622,8 @@ def main() -> None:
             dt = source_frame_interval if source_frame_interval is not None else max(1e-3, now - last_frame_time)
             last_frame_time = now
             timestamp += dt
+            if llm_temporal_frames > 0:
+                temporal_frame_history.append((frame_index, frame.copy()))
 
             inference_frame, sx, sy = resize_for_processing(frame, args.process_width)
             infer_start = time.perf_counter()
@@ -1596,7 +1701,30 @@ def main() -> None:
                     setattr(feature, "state_event", "falling")
                 setattr(feature, "fall_started", current_state == "FALL" and previous_state != "FALL")
                 if fall_llm_verifier is not None and current_state == "FALL":
-                    fall_llm_verifier.submit(track_id, frame_index, frame, detection.bbox)
+                    locked_event = confirmed_event_lock_for(track_id, detection.bbox, frame_index)
+                    if locked_event is not None:
+                        logging.debug(
+                            "Confirmed-event lock suppresses LLM candidate: track=%s frame=%s locked_track=%s locked_frame=%s",
+                            track_id,
+                            frame_index,
+                            locked_event.track_id,
+                            locked_event.frame_index,
+                        )
+                    elif track_id not in pending_temporal_fall_checks:
+                        before_frame = frame
+                        if llm_temporal_frames > 0:
+                            target = frame_index - llm_temporal_frames
+                            before_frame = next(
+                                (history_frame for history_index, history_frame in temporal_frame_history if history_index == target),
+                                frame,
+                            )
+                        pending_temporal_fall_checks[track_id] = PendingTemporalFallCheck(
+                            track_id=track_id,
+                            frame_index=frame_index,
+                            bbox=detection.bbox,
+                            before_frame=before_frame.copy(),
+                            candidate_frame=frame.copy(),
+                        )
                 # The dashboard creates and moves a box only from object_update.
                 # Respect the CLI controls for ordinary people as well as FALL;
                 # previously these options were parsed but never applied here.
@@ -1607,16 +1735,24 @@ def main() -> None:
                 )
                 setattr(feature, "event_type", "object_update" if publish_as_update else "object_exist")
                 person.last_publish_item = (detection, geometry, feature)
-                if args.display:
+                if args.display or output_video_path is not None:
                     display_items.append((detection, geometry, feature))
                 llm_allows_publish = (
                     current_state != "FALL"
                     or fall_llm_verifier is None
-                    or fall_llm_verifier.is_approved(track_id)
+                    or (
+                        fall_llm_verifier.is_approved(track_id)
+                        and track_id in pending_confirmed_alert_track_ids
+                    )
                 )
                 fall_only_allows_publish = (
                     not args.publish_fall_only
-                    or (feature.state == "FALL" and fall_llm_verifier is not None and fall_llm_verifier.is_approved(track_id))
+                    or (
+                        feature.state == "FALL"
+                        and fall_llm_verifier is not None
+                        and fall_llm_verifier.is_approved(track_id)
+                        and track_id in pending_confirmed_alert_track_ids
+                    )
                 )
                 if publisher is not None and llm_allows_publish and fall_only_allows_publish:
                     publish_items.append((detection, geometry, feature))
@@ -1667,22 +1803,79 @@ def main() -> None:
                             setattr(feature, "state_event", "")
                             setattr(feature, "fall_started", False)
                             setattr(feature, "event_type", "object_exist")
-                        if args.display:
+                        if args.display or output_video_path is not None:
                             display_items.append((detection, geometry, feature))
                         llm_allows_publish = (
                             feature.state != "FALL"
                             or fall_llm_verifier is None
-                            or fall_llm_verifier.is_approved(track_id)
+                            or (
+                                fall_llm_verifier.is_approved(track_id)
+                                and track_id in pending_confirmed_alert_track_ids
+                            )
                         )
                         fall_only_allows_publish = (
                             not args.publish_fall_only
-                            or (feature.state == "FALL" and fall_llm_verifier is not None and fall_llm_verifier.is_approved(track_id))
+                            or (
+                                feature.state == "FALL"
+                                and fall_llm_verifier is not None
+                                and fall_llm_verifier.is_approved(track_id)
+                                and track_id in pending_confirmed_alert_track_ids
+                            )
                         )
                         if publisher is not None and llm_allows_publish and fall_only_allows_publish:
                             publish_items.append((detection, geometry, feature))
                             held_publish_ids.append(track_id)
 
             if fall_llm_verifier is not None:
+                for pending_track_id, candidate in list(pending_temporal_fall_checks.items()):
+                    if frame_index < candidate.frame_index + llm_temporal_frames:
+                        continue
+                    duplicate_lock = confirmed_event_lock_for(
+                        candidate.track_id,
+                        candidate.bbox,
+                        frame_index,
+                    )
+                    if duplicate_lock is not None:
+                        logging.debug(
+                            "Confirmed-event lock suppresses queued LLM candidate: track=%s frame=%s locked_track=%s locked_frame=%s",
+                            candidate.track_id,
+                            candidate.frame_index,
+                            duplicate_lock.track_id,
+                            duplicate_lock.frame_index,
+                        )
+                        del pending_temporal_fall_checks[pending_track_id]
+                        continue
+                    reference_context: ConfirmedFallContext | None = None
+                    while (
+                        confirmed_fall_contexts
+                        and frame_index - confirmed_fall_contexts[0].frame_index > llm_context_frames
+                    ):
+                        confirmed_fall_contexts.popleft()
+                    for context in reversed(confirmed_fall_contexts):
+                        if (
+                            llm_context_frames <= 0
+                            or candidate.frame_index < context.frame_index
+                            or context.bbox is None
+                        ):
+                            continue
+                        if (
+                            (llm_context_match_same_track and candidate.track_id == context.track_id)
+                            or bbox_iou(candidate.bbox, context.bbox) >= llm_context_iou
+                            or bbox_center_distance_ratio(candidate.bbox, context.bbox) <= llm_context_center_ratio
+                        ):
+                            reference_context = context
+                            break
+                    fall_llm_verifier.submit(
+                        candidate.track_id,
+                        candidate.frame_index,
+                        candidate.candidate_frame,
+                        candidate.bbox,
+                        reference_frame=reference_context.frame if reference_context else None,
+                        reference_frame_index=reference_context.frame_index if reference_context else None,
+                        before_frame=candidate.before_frame if llm_temporal_frames > 0 else None,
+                        after_frame=frame if llm_temporal_frames > 0 else None,
+                    )
+                    del pending_temporal_fall_checks[pending_track_id]
                 fall_llm_verifier.forget_inactive(
                     {
                         track_id
@@ -1690,6 +1883,30 @@ def main() -> None:
                         if person.current_state == "FALL" or person.fall_hold_remaining > 0
                     }
                 )
+
+            # Video recording must be independent of metadata publishing.  In
+            # particular, --publish-fall-only intentionally produces no
+            # publish_items for normal frames; previously those frames took an
+            # early ``continue`` below and were missing from the saved video.
+            annotated_frame = frame
+            if args.display or output_video_path is not None:
+                annotated_frame = frame.copy()
+                for detection, geometry, feature in display_items:
+                    visualizer.draw(
+                        annotated_frame,
+                        detection,
+                        geometry,
+                        feature,
+                    )
+
+            if output_video_path is not None:
+                if output_writer is None:
+                    height, width = annotated_frame.shape[:2]
+                    frame_interval = cap.source_frame_interval()
+                    output_fps = 1.0 / frame_interval if frame_interval else 25.0
+                    output_writer = open_web_video_writer(output_video_path, output_fps, (width, height))
+                    logging.info("Saving annotated video to: %s", output_video_path)
+                output_writer.write(annotated_frame)
 
             publish_every_n = max(1, int(args.publish_every_n))
             if publisher is not None and frame_index % publish_every_n == 0:
@@ -1732,6 +1949,7 @@ def main() -> None:
                     consecutive_empty_publish_frames = 0
                 image_height, image_width = frame.shape[:2]
                 fall_object_ids = publish_fall_object_ids(publish_items)
+                confirmed_alert_ids_in_message = fall_object_ids & pending_confirmed_alert_track_ids
                 new_fall_object_ids = fall_object_ids - active_fall_publish_ids
                 active_fall_publish_ids = fall_object_ids
                 if args.publish_sample_resource and fall_llm_verifier is None and not sample_resource_ready:
@@ -1812,6 +2030,24 @@ def main() -> None:
                             )
                     try:
                         publisher.publish(message)
+                        if confirmed_alert_ids_in_message:
+                            pending_confirmed_alert_track_ids.difference_update(confirmed_alert_ids_in_message)
+                            if not args.publish_dry_run and not args.publish_fast_async:
+                                # run_video.ps1 uses the synchronous producer, which returns
+                                # only after the broker delivery callback succeeds.
+                                logging.warning(
+                                    "Kafka delivered LLM-confirmed fall alert: frame=%s tracks=%s image_path=%s asset_id=%s",
+                                    frame_index,
+                                    sorted(confirmed_alert_ids_in_message),
+                                    message_image_path,
+                                    message_asset_id,
+                                )
+                            else:
+                                logging.info(
+                                    "LLM-confirmed fall alert queued/dry-run: frame=%s tracks=%s",
+                                    frame_index,
+                                    sorted(confirmed_alert_ids_in_message),
+                                )
                         if publisher.should_log_success():
                             action = "Queued" if args.publish_fast_async else "Published"
                             logging.info("%s metadata: cam_id=%s frame=%s objects=%s", action, args.cam_id, frame_index, len(publish_items))
@@ -1819,26 +2055,6 @@ def main() -> None:
                         logging.warning("Kafka local queue is full, dropping frame metadata: %s", exc)
                     except Exception:
                         logging.exception("Cannot publish AI metadata message")
-
-            annotated_frame = frame
-            if args.display or output_video_path is not None:
-                annotated_frame = frame.copy()
-                for detection, geometry, feature in display_items:
-                    visualizer.draw(
-                        annotated_frame,
-                        detection,
-                        geometry,
-                        feature,
-                    )
-
-            if output_video_path is not None:
-                if output_writer is None:
-                    height, width = annotated_frame.shape[:2]
-                    frame_interval = cap.source_frame_interval()
-                    output_fps = 1.0 / frame_interval if frame_interval else 25.0
-                    output_writer = open_web_video_writer(output_video_path, output_fps, (width, height))
-                    logging.info("Saving annotated video to: %s", output_video_path)
-                output_writer.write(annotated_frame)
 
             if args.display:
                 preview = resize_for_preview(annotated_frame, preview_w, preview_h)

@@ -33,6 +33,51 @@ zoom.onclick=e=>{if(e.target===zoomImage){zoomImage.classList.toggle('big')}else
 </script></body></html>"""
 
 
+PAGE = PAGE.replace(
+    "</style>",
+    """.fall-timeline{position:relative;height:26px;margin:10px 2px 0;border-radius:7px;background:#0b1321;border:1px solid #31425e;overflow:hidden;cursor:pointer}.fall-timeline-progress{position:absolute;inset:0 auto 0 0;width:0;background:#1e467055;pointer-events:none}.fall-marker{position:absolute;top:3px;bottom:3px;width:max(7px,.55%);transform:translateX(-50%);border:0;border-radius:3px;background:#ff5c75;box-shadow:0 0 0 1px #ffd2da;cursor:pointer;padding:0}.fall-marker:hover,.fall-marker:focus{background:#ffd166;outline:2px solid #fff;z-index:1}.timeline-label{margin:6px 0 0;font-size:12px;color:#9fb0c9}</style>""",
+)
+PAGE = PAGE.replace(
+    '<div class="video-wrap"><video id="player" controls preload="metadata"></video></div>',
+    '<div class="video-wrap"><video id="player" controls preload="metadata"></video></div><div id="fallTimeline" class="fall-timeline" title="Click a checkpoint to seek"><div id="timelineProgress" class="fall-timeline-progress"></div></div><p id="timelineLabel" class="timeline-label">Red checkpoints mark LLM-confirmed falls.</p>',
+)
+PAGE = PAGE.replace(
+    "</body>",
+    """<script>
+(() => {
+  const timeline = document.querySelector('#fallTimeline');
+  const progress = document.querySelector('#timelineProgress');
+  const label = document.querySelector('#timelineLabel');
+  const parseFrame = src => { const match = src.match(/fall_frame_(\\d+)_track_/); return match ? Number(match[1]) : null; };
+  const seek = seconds => { player.currentTime = seconds; player.play().catch(() => {}); };
+  const drawCheckpoints = () => {
+    const duration = player.duration;
+    if (!Number.isFinite(duration) || duration <= 0) { label.textContent = 'Đang tải các mốc cảnh ngã…'; return; }
+    const checkpoints = [...gallery.querySelectorAll('.crop')].map(card => {
+      const frame = parseFrame(card.dataset.src); return frame === null ? null : { frame, seconds: frame / 30 };
+    }).filter(item => item && item.seconds <= duration);
+    timeline.replaceChildren(progress, ...checkpoints.map(item => {
+      const marker = document.createElement('button');
+      marker.className = 'fall-marker';
+      marker.style.left = `${Math.min(100, item.seconds / duration * 100)}%`;
+      marker.title = `Mốc ngã: frame ${item.frame} (${item.seconds.toFixed(1)} giây)`;
+      marker.setAttribute('aria-label', marker.title);
+      marker.onclick = event => { event.stopPropagation(); seek(item.seconds); };
+      return marker;
+    }));
+    label.textContent = checkpoints.length ? `${checkpoints.length} checkpoint ngã đã được LLM xác nhận — click mốc đỏ để tua.` : 'Chưa có checkpoint ngã được LLM xác nhận.';
+  };
+  player.addEventListener('loadedmetadata', drawCheckpoints);
+  player.addEventListener('timeupdate', () => { progress.style.width = player.duration ? `${player.currentTime / player.duration * 100}%` : '0%'; });
+  timeline.onclick = event => { if (event.target !== timeline && event.target !== progress) return; const rect = timeline.getBoundingClientRect(); seek((event.clientX - rect.left) / rect.width * player.duration); };
+  const previousLoad = load;
+  load = async () => { await previousLoad(); drawCheckpoints(); };
+  load();
+})();
+</script></body>""",
+)
+
+
 def list_files(directory: Path, suffixes: set[str]) -> list[str]:
     if not directory.exists():
         return []

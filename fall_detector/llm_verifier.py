@@ -41,6 +41,7 @@ class FallLLMVerifier:
         image_max_width: int,
         jpeg_quality: int,
         retry_after_frames: int,
+        system_prompt: str | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -49,6 +50,12 @@ class FallLLMVerifier:
         self.image_max_width = image_max_width
         self.jpeg_quality = jpeg_quality
         self.retry_after_frames = max(1, retry_after_frames)
+        self.system_prompt = str(system_prompt or "").strip() or (
+            "You verify CCTV fall alerts. Respond with JSON only: "
+            '{"is_fall":true|false,"reason":"short reason"}. '
+            "Set is_fall true only when the person is visibly falling or lying on the ground "
+            "in a way consistent with a real fall."
+        )
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fall-llm")
         self._results: SimpleQueue[FallVerificationResult] = SimpleQueue()
         self._pending: set[int] = set()
@@ -62,17 +69,35 @@ class FallLLMVerifier:
         frame_index: int,
         frame: np.ndarray,
         bbox: tuple[float, float, float, float] | None = None,
+        reference_frame: np.ndarray | None = None,
+        reference_frame_index: int | None = None,
+        before_frame: np.ndarray | None = None,
+        after_frame: np.ndarray | None = None,
     ) -> bool:
         """Queue one verification per active track. Returns True when queued."""
         with self._lock:
-            if track_id in self._pending or self._decisions.get(track_id) is True:
+            # A semantic LLM decision (true *or* false) settles this raw FALL
+            # episode.  Re-querying a rejected person every retry interval is
+            # both noisy and can turn a standing-up sequence into a later
+            # false positive.  Transport failures remain retryable below.
+            if track_id in self._pending or track_id in self._decisions:
                 return False
             previous_frame = self._last_submitted_frame.get(track_id)
             if previous_frame is not None and frame_index - previous_frame < self.retry_after_frames:
                 return False
             self._pending.add(track_id)
             self._last_submitted_frame[track_id] = frame_index
-        future = self._executor.submit(self._verify, track_id, frame_index, frame.copy(), bbox)
+        future = self._executor.submit(
+            self._verify,
+            track_id,
+            frame_index,
+            frame.copy(),
+            bbox,
+            reference_frame.copy() if reference_frame is not None else None,
+            reference_frame_index,
+            before_frame.copy() if before_frame is not None else None,
+            after_frame.copy() if after_frame is not None else None,
+        )
         future.add_done_callback(self._on_done)
         logging.info("Queued LLM fall verification: track=%s frame=%s", track_id, frame_index)
         return True
@@ -85,7 +110,12 @@ class FallLLMVerifier:
             return
         with self._lock:
             self._pending.discard(result.track_id)
-            self._decisions[result.track_id] = result.confirmed
+            if result.reason.startswith("LLM verification failed:"):
+                # Do not settle an episode on a timeout/connectivity failure;
+                # submit() may retry after retry_after_frames.
+                self._decisions.pop(result.track_id, None)
+            else:
+                self._decisions[result.track_id] = result.confirmed
         self._results.put(result)
 
     def drain_results(self) -> list[FallVerificationResult]:
@@ -123,27 +153,48 @@ class FallLLMVerifier:
         frame_index: int,
         frame: np.ndarray,
         bbox: tuple[float, float, float, float] | None,
+        reference_frame: np.ndarray | None = None,
+        reference_frame_index: int | None = None,
+        before_frame: np.ndarray | None = None,
+        after_frame: np.ndarray | None = None,
     ) -> FallVerificationResult:
         try:
-            image_data_url = self._encode_image(frame)
+            user_content: list[dict[str, Any]] = [
+                {"type": "text", "text": "Does this CCTV image show a real human fall?"},
+                {"type": "image_url", "image_url": {"url": self._encode_image(frame)}},
+            ]
+            if before_frame is not None and after_frame is not None:
+                user_content = [
+                    {"type": "text", "text": "Images 1, 2, and 3 are 0.5 seconds before, at, and 0.5 seconds after the fall candidate. Confirm is_fall=true only when this short sequence shows a real uncontrolled fall."},
+                    {"type": "image_url", "image_url": {"url": self._encode_image(before_frame)}},
+                    {"type": "image_url", "image_url": {"url": self._encode_image(frame)}},
+                    {"type": "image_url", "image_url": {"url": self._encode_image(after_frame)}},
+                ]
+            if reference_frame is not None:
+                user_content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Image 1 is an earlier LLM-confirmed fall (frame {reference_frame_index}). "
+                            "Images 2, 3, and 4 are 0.5 seconds before, at, and 0.5 seconds after the current candidate. "
+                            "Return is_fall=true only for a NEW fall; return is_fall=false for continuation or recovery."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": self._encode_image(reference_frame)}},
+                    {"type": "image_url", "image_url": {"url": self._encode_image(before_frame if before_frame is not None else frame)}},
+                    {"type": "image_url", "image_url": {"url": self._encode_image(frame)}},
+                    {"type": "image_url", "image_url": {"url": self._encode_image(after_frame if after_frame is not None else frame)}},
+                ]
             payload = {
                 "model": self.model,
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You verify CCTV fall alerts. Respond with JSON only: "
-                            '{"is_fall":true|false,"reason":"short reason"}. '
-                            "Set is_fall true only when the person is visibly falling or lying on the ground "
-                            "in a way consistent with a real fall."
-                        ),
+                        "content": self.system_prompt,
                     },
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Does this CCTV image show a real human fall?"},
-                            {"type": "image_url", "image_url": {"url": image_data_url}},
-                        ],
+                        "content": user_content,
                     },
                 ],
                 "temperature": 0,
