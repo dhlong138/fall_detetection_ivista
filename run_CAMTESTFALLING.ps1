@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $configPath = Join-Path $PSScriptRoot "camera_configs\CAMTESTFALLING.json"
 $config = Get-Content -Raw -Path $configPath | ConvertFrom-Json
 
-python "$PSScriptRoot\loop_realtime_yolo11x_pose.py" `
+python "$PSScriptRoot\scripts\loop_realtime_yolo11x_pose.py" `
   --display `
   --publish `
   --publish-fast-async `

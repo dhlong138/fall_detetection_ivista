@@ -24,6 +24,7 @@ class FallVerificationResult:
     confirmed: bool
     reason: str
     frame: np.ndarray
+    bbox: tuple[float, float, float, float] | None = None
 
 
 class FallLLMVerifier:
@@ -39,6 +40,7 @@ class FallLLMVerifier:
         max_workers: int,
         image_max_width: int,
         jpeg_quality: int,
+        retry_after_frames: int,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -46,19 +48,31 @@ class FallLLMVerifier:
         self.timeout_seconds = timeout_seconds
         self.image_max_width = image_max_width
         self.jpeg_quality = jpeg_quality
+        self.retry_after_frames = max(1, retry_after_frames)
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fall-llm")
         self._results: SimpleQueue[FallVerificationResult] = SimpleQueue()
         self._pending: set[int] = set()
         self._decisions: dict[int, bool] = {}
+        self._last_submitted_frame: dict[int, int] = {}
         self._lock = threading.Lock()
 
-    def submit(self, track_id: int, frame_index: int, frame: np.ndarray) -> bool:
+    def submit(
+        self,
+        track_id: int,
+        frame_index: int,
+        frame: np.ndarray,
+        bbox: tuple[float, float, float, float] | None = None,
+    ) -> bool:
         """Queue one verification per active track. Returns True when queued."""
         with self._lock:
-            if track_id in self._pending or track_id in self._decisions:
+            if track_id in self._pending or self._decisions.get(track_id) is True:
+                return False
+            previous_frame = self._last_submitted_frame.get(track_id)
+            if previous_frame is not None and frame_index - previous_frame < self.retry_after_frames:
                 return False
             self._pending.add(track_id)
-        future = self._executor.submit(self._verify, track_id, frame_index, frame.copy())
+            self._last_submitted_frame[track_id] = frame_index
+        future = self._executor.submit(self._verify, track_id, frame_index, frame.copy(), bbox)
         future.add_done_callback(self._on_done)
         logging.info("Queued LLM fall verification: track=%s frame=%s", track_id, frame_index)
         return True
@@ -92,16 +106,24 @@ class FallLLMVerifier:
             for track_id in list(self._decisions):
                 if track_id not in active_track_ids:
                     self._decisions.pop(track_id, None)
+                    self._last_submitted_frame.pop(track_id, None)
 
     def invalidate(self, track_id: int) -> None:
         """Suppress a decision when its confirmed image cannot be prepared."""
         with self._lock:
             self._decisions.pop(track_id, None)
+            self._last_submitted_frame.pop(track_id, None)
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _verify(self, track_id: int, frame_index: int, frame: np.ndarray) -> FallVerificationResult:
+    def _verify(
+        self,
+        track_id: int,
+        frame_index: int,
+        frame: np.ndarray,
+        bbox: tuple[float, float, float, float] | None,
+    ) -> FallVerificationResult:
         try:
             image_data_url = self._encode_image(frame)
             payload = {
@@ -136,9 +158,9 @@ class FallLLMVerifier:
             body = response.json()
             content = body["choices"][0]["message"]["content"]
             confirmed, reason = self._parse_decision(content)
-            return FallVerificationResult(track_id, frame_index, confirmed, reason, frame)
+            return FallVerificationResult(track_id, frame_index, confirmed, reason, frame, bbox)
         except Exception as exc:
-            return FallVerificationResult(track_id, frame_index, False, f"LLM verification failed: {exc}", frame)
+            return FallVerificationResult(track_id, frame_index, False, f"LLM verification failed: {exc}", frame, bbox)
 
     def _encode_image(self, frame: np.ndarray) -> str:
         image = frame

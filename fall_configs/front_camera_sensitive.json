@@ -1,0 +1,16 @@
+{
+  "fall_detection": {
+    "angle_threshold": 42.0,
+    "angle_change_threshold": 20.0,
+    "aspect_ratio_threshold": 1.7,
+    "aspect_ratio_drop_threshold": 0.2,
+    "velocity_threshold": 0.8,
+    "acceleration_threshold": 1.8,
+    "candidate_threshold": 0.4,
+    "fall_threshold": 0.52,
+    "persistence_frames": 3,
+    "cooldown_frames": 15,
+    "upright_angle_threshold": 25.0,
+    "upright_aspect_ratio_threshold": 1.7
+  }
+}

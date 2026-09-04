@@ -1,0 +1,49 @@
+{
+  "pose": {
+    "device": "cuda",
+    "pose_model": "yolo11x-pose.pt",
+    "det_input_size": 640,
+    "detector_score_thr": 0.1,
+    "detector_nms_thr": 0.45,
+    "keypoint_confidence": 0.35
+  },
+  "tracking": {
+    "enabled": true,
+    "tracker": "bytetrack.yaml",
+    "max_missing_frames": 30
+  },
+  "temporal": {
+    "window_size": 30,
+    "min_history": 10
+  },
+  "fall_detection": {
+    "angle_threshold": 60.0,
+    "angle_change_threshold": 35.0,
+    "aspect_ratio_threshold": 1.15,
+    "aspect_ratio_drop_threshold": 0.35,
+    "velocity_threshold": 1.2,
+    "acceleration_threshold": 2.5,
+    "candidate_threshold": 0.55,
+    "fall_threshold": 0.7,
+    "recovery_threshold": 0.35,
+    "persistence_frames": 5,
+    "cooldown_frames": 20,
+    "upright_angle_threshold": 35.0,
+    "upright_aspect_ratio_threshold": 1.45,
+    "require_observed_upright": true,
+    "weights": {
+      "angle": 0.2,
+      "angle_change": 0.15,
+      "aspect_ratio": 0.3,
+      "aspect_ratio_change": 0.2,
+      "velocity": 0.1,
+      "acceleration": 0.05
+    }
+  },
+  "features": {
+    "use_angle": true,
+    "use_aspect_ratio": true,
+    "use_velocity": true,
+    "use_acceleration": true
+  }
+}

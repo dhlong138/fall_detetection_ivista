@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -25,7 +26,7 @@ from .capture import LatestFrameCapture
 from .llm_verifier import FallLLMVerifier
 from .settings import CONFIG, DEFAULT_CAMERA_URL, DEFAULT_STORAGE_BASE_PATH
 
-from realtime_ai_publisher import (
+from tools.realtime_ai_publisher import (
     DEFAULT_BOOTSTRAP_SERVERS,
     DEFAULT_META_TYPE,
     SAMPLE_DIR,
@@ -963,6 +964,85 @@ def resize_for_preview(frame: np.ndarray, max_width: int, max_height: int) -> np
     return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
 
+def next_numbered_video_path(output_dir: str | Path, source: str) -> Path:
+    """Return a non-overwriting MP4 path: ``video_001.mp4``, then ``_002``."""
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    source_path = Path(urlsplit(source).path)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", source_path.stem).strip("_") or "video"
+    for index in range(1, 1_000_000):
+        candidate = directory / f"{stem}_{index:03d}.mp4"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not allocate an output filename in {directory}")
+
+
+def open_web_video_writer(path: Path, fps: float, size: tuple[int, int]) -> cv2.VideoWriter:
+    """Create H.264 video that plays in standard browsers, with a safe fallback."""
+    writer = cv2.VideoWriter(str(path), cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*"avc1"), fps, size)
+    if writer.isOpened():
+        logging.info("Using browser-compatible H.264 output: %s", path)
+        return writer
+    writer.release()
+    logging.warning("H.264 encoder unavailable; falling back to MP4V output: %s", path)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot create output video: {path}")
+    return writer
+
+
+def load_runtime_config(settings_file: str | None) -> dict[str, Any]:
+    """Return the default settings with an optional JSON override applied."""
+    config = copy.deepcopy(CONFIG)
+    if not settings_file:
+        return config
+    path = Path(settings_file)
+    try:
+        overrides = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read settings file {path}: {exc}") from exc
+    if not isinstance(overrides, dict):
+        raise ValueError(f"Settings file must contain a JSON object: {path}")
+    for section, values in overrides.items():
+        if section not in config or not isinstance(values, dict):
+            raise ValueError(f"Unsupported settings section in {path}: {section}")
+        unknown_keys = set(values) - set(config[section])
+        if unknown_keys:
+            raise ValueError(f"Unsupported settings keys in {path}: {', '.join(sorted(unknown_keys))}")
+        config[section].update(values)
+    logging.info("Loaded runtime settings override: %s", path)
+    return config
+
+
+def save_fall_crop(
+    frame: np.ndarray,
+    bbox: tuple[float, float, float, float] | None,
+    output_dir: str | Path,
+    frame_index: int,
+    track_id: int,
+) -> np.ndarray:
+    """Save a padded person crop locally and return it for alert attachment."""
+    height, width = frame.shape[:2]
+    if bbox is None:
+        crop = frame
+    else:
+        x1, y1, x2, y2 = bbox
+        padding_x = max(20, int((x2 - x1) * 0.15))
+        padding_y = max(20, int((y2 - y1) * 0.15))
+        left, top = max(0, int(x1) - padding_x), max(0, int(y1) - padding_y)
+        right, bottom = min(width, int(x2) + padding_x), min(height, int(y2) + padding_y)
+        crop = frame[top:bottom, left:right]
+        if crop.size == 0:
+            crop = frame
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    crop_path = directory / f"fall_frame_{frame_index:06d}_track_{track_id:03d}.jpg"
+    if not cv2.imwrite(str(crop_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+        raise RuntimeError(f"Cannot save fall crop: {crop_path}")
+    logging.warning("LLM-confirmed fall crop saved: %s", crop_path)
+    return crop
+
+
 def resize_for_processing(frame: np.ndarray, max_width: int | None):
     if not max_width:
         return frame, 1.0, 1.0
@@ -1083,6 +1163,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Single-file realtime fall detection with YOLO11x pose.")
     parser.add_argument("--url", help="Camera URL. When omitted, load it from camera_configs/<cam-id>.json, then RTSP_URL, then the default camera.")
     parser.add_argument("--video", help="Local video file. When provided, this takes precedence over --url.")
+    parser.add_argument("--settings-file", help="Optional JSON override for fall-detection settings.")
     parser.add_argument("--model", default=CONFIG["pose"]["pose_model"], help="YOLO pose model path, e.g. yolo11x-pose.pt or a TensorRT .engine file.")
     parser.add_argument("--device", default=CONFIG["pose"]["device"], help="Inference device, e.g. cuda, cuda:0, 0, or cpu.")
     parser.add_argument("--imgsz", type=int, default=CONFIG["pose"]["det_input_size"], help="YOLO inference image size.")
@@ -1099,10 +1180,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-width", type=int, help="Max preview window width. Defaults to 92 percent of screen width.")
     parser.add_argument("--preview-height", type=int, help="Max preview window height. Defaults to 86 percent of screen height.")
     parser.add_argument("--log-interval", type=float, default=5.0, help="Seconds between realtime speed logs.")
+    parser.add_argument("--progress-interval", type=float, default=5.0, help="Seconds between local-video progress logs. Use 0 to disable.")
     parser.add_argument("--reconnect-delay", type=float, default=2.0, help="Seconds to wait before reconnecting.")
     parser.add_argument("--loop-video", action=argparse.BooleanOptionalAction, default=True, help="Restart a finished video source; for RTSP replay sources, reconnect to begin the replay again.")
     parser.add_argument("--video-loop-count", type=int, default=0, help="Stop after this many complete video passes. Use 0 to loop forever.")
+    parser.add_argument("--save-video-dir", help="Directory for an annotated MP4 output. A new numbered filename is created for every run.")
     parser.add_argument("--publish", action=argparse.BooleanOptionalAction, default=False, help="Publish AI metadata messages to Kafka.")
+    parser.add_argument("--publish-fall-only", action=argparse.BooleanOptionalAction, default=False, help="Publish only FALL alerts; normal persons and candidates are omitted.")
     parser.add_argument("--publish-dry-run", action=argparse.BooleanOptionalAction, default=False, help="Build and log messages without sending to Kafka.")
     parser.add_argument("--publish-log-json", action=argparse.BooleanOptionalAction, default=False, help="Log every metadata JSON payload.")
     parser.add_argument("--publish-log-delivery", action=argparse.BooleanOptionalAction, default=False, help="Log every successful Kafka delivery callback.")
@@ -1130,6 +1214,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fall-llm-workers", type=int, default=int(os.getenv("FALL_LLM_WORKERS", "2")), help="Maximum concurrent fall-verification requests.")
     parser.add_argument("--fall-llm-image-max-width", type=int, default=int(os.getenv("FALL_LLM_IMAGE_MAX_WIDTH", "1280")), help="Maximum JPEG width submitted to the LLM. Use 0 for original width.")
     parser.add_argument("--fall-llm-jpeg-quality", type=int, default=int(os.getenv("FALL_LLM_JPEG_QUALITY", "85")), help="JPEG quality for the image submitted to the LLM.")
+    parser.add_argument("--fall-llm-retry-frames", type=int, default=30, help="Retry a rejected LLM fall check after this many frames while the person remains in FALL.")
+    parser.add_argument("--fall-crops-dir", default="output_fall_crops", help="Directory for crops confirmed by the fall LLM.")
     parser.add_argument("--force-fall-alert", action=argparse.BooleanOptionalAction, default=False, help="Publish every detected person as a falling blacklist alert for UI integration testing.")
     parser.add_argument("--fall-probe-log-threshold", type=float, default=1.01, help="Log non-fall probe metrics only when fall_score is at or above this value. Use 0.25 for verbose debugging.")
     parser.add_argument("--publish-sample-resource", action=argparse.BooleanOptionalAction, default=True, help="Save the first camera frame using the sample storage layout and attach image_path/asset_id.")
@@ -1178,6 +1264,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    try:
+        runtime_config = load_runtime_config(args.settings_file)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     logging.info("Opening camera: %s", mask_url(args.url))
     logging.info("Model: %s", args.model)
     logging.info("Device: %s", args.device)
@@ -1199,10 +1289,10 @@ def main() -> None:
         iou=args.iou,
         tracker=args.tracker,
     )
-    tracker = Tracker(estimator, enabled=bool(CONFIG["tracking"].get("enabled", True)))
-    classifier = RuleBasedFallClassifier(CONFIG)
-    state_machine = FallStateMachine(CONFIG)
-    visualizer = Visualizer(float(CONFIG["pose"]["keypoint_confidence"]), debug=args.debug)
+    tracker = Tracker(estimator, enabled=bool(runtime_config["tracking"].get("enabled", True)))
+    classifier = RuleBasedFallClassifier(runtime_config)
+    state_machine = FallStateMachine(runtime_config)
+    visualizer = Visualizer(float(runtime_config["pose"]["keypoint_confidence"]), debug=args.debug)
     service_instance_id = args.service_instance_id or str(uuid.uuid4())
     publisher = None
     if args.publish or args.publish_dry_run:
@@ -1225,12 +1315,14 @@ def main() -> None:
 
     cap = LatestFrameCapture(args.url, args.buffer_size, args.reconnect_delay, args.loop_video, args.video_loop_count)
     cap.start()
+    output_video_path = next_numbered_video_path(args.save_video_dir, args.url) if args.save_video_dir else None
+    output_writer: cv2.VideoWriter | None = None
     persons: dict[int, PersonState] = {}
     raw_to_logical_track_id: dict[int, int] = {}
     logical_last_bbox: dict[int, tuple[float, float, float, float]] = {}
     next_logical_track_id = 1
     max_missing = max(
-        int(CONFIG["tracking"].get("max_missing_frames", 60)),
+        int(runtime_config["tracking"].get("max_missing_frames", 60)),
         max(0, int(args.publish_missing_hold_frames)),
     )
     frame_index = 0
@@ -1242,6 +1334,7 @@ def main() -> None:
     stats_people = 0
     last_capture_seq = 0
     last_capture_loop_generation = cap.loop_generation()
+    last_progress_log_at = time.perf_counter()
     consecutive_empty_publish_frames = 0
     publish_image_path = ""
     publish_asset_id: str | None = None
@@ -1274,6 +1367,7 @@ def main() -> None:
             max_workers=max(1, int(args.fall_llm_workers)),
             image_max_width=max(0, int(args.fall_llm_image_max_width)),
             jpeg_quality=min(100, max(1, int(args.fall_llm_jpeg_quality))),
+            retry_after_frames=max(1, int(args.fall_llm_retry_frames)),
         )
         logging.info("LLM fall verification enabled: url=%s model=%s workers=%s", args.fall_llm_api_url, args.fall_llm_model, args.fall_llm_workers)
 
@@ -1382,8 +1476,15 @@ def main() -> None:
                             logging.debug("LLM rejected fall alert: track=%s frame=%s reason=%s", result.track_id, result.frame_index, result.reason)
                         continue
                     try:
-                        llm_result_image_path, llm_result_asset_id = prepare_publish_resource(
+                        confirmed_crop = save_fall_crop(
                             result.frame,
+                            result.bbox,
+                            args.fall_crops_dir,
+                            result.frame_index,
+                            result.track_id,
+                        )
+                        llm_result_image_path, llm_result_asset_id = prepare_publish_resource(
+                            confirmed_crop,
                             "LLM-confirmed fall",
                             result.frame_index,
                         )
@@ -1468,12 +1569,12 @@ def main() -> None:
                 id_debug_pairs.append((raw_track_id, track_id))
                 seen_ids.add(track_id)
                 is_new_track = track_id not in persons
-                person = persons.setdefault(track_id, PersonState(track_id, int(CONFIG["temporal"]["window_size"])))
+                person = persons.setdefault(track_id, PersonState(track_id, int(runtime_config["temporal"]["window_size"])))
                 person.missing_frames = 0
-                geometry = compute_body_geometry(detection, float(CONFIG["pose"]["keypoint_confidence"]))
+                geometry = compute_body_geometry(detection, float(runtime_config["pose"]["keypoint_confidence"]))
                 feature = compute_motion_features(frame_index, timestamp, track_id, geometry, person.previous, dt)
                 person.add(feature)
-                min_history = int(CONFIG["temporal"]["min_history"])
+                min_history = int(runtime_config["temporal"]["min_history"])
                 fall_score = classifier.predict(person) if len(person.features) >= min_history else 0.0
                 previous_state = person.current_state
                 current_state = state_machine.update(person, feature, fall_score)
@@ -1495,7 +1596,7 @@ def main() -> None:
                     setattr(feature, "state_event", "falling")
                 setattr(feature, "fall_started", current_state == "FALL" and previous_state != "FALL")
                 if fall_llm_verifier is not None and current_state == "FALL":
-                    fall_llm_verifier.submit(track_id, frame_index, frame)
+                    fall_llm_verifier.submit(track_id, frame_index, frame, detection.bbox)
                 # The dashboard creates and moves a box only from object_update.
                 # Respect the CLI controls for ordinary people as well as FALL;
                 # previously these options were parsed but never applied here.
@@ -1508,11 +1609,16 @@ def main() -> None:
                 person.last_publish_item = (detection, geometry, feature)
                 if args.display:
                     display_items.append((detection, geometry, feature))
-                if publisher is not None and (
+                llm_allows_publish = (
                     current_state != "FALL"
                     or fall_llm_verifier is None
                     or fall_llm_verifier.is_approved(track_id)
-                ):
+                )
+                fall_only_allows_publish = (
+                    not args.publish_fall_only
+                    or (feature.state == "FALL" and fall_llm_verifier is not None and fall_llm_verifier.is_approved(track_id))
+                )
+                if publisher is not None and llm_allows_publish and fall_only_allows_publish:
                     publish_items.append((detection, geometry, feature))
                 if feature.state == "FALL" and fall_llm_verifier is None:
                     logging.warning("FALL detected: track=%s score=%.2f frame=%s", track_id, feature.fall_score, frame_index)
@@ -1563,11 +1669,16 @@ def main() -> None:
                             setattr(feature, "event_type", "object_exist")
                         if args.display:
                             display_items.append((detection, geometry, feature))
-                        if publisher is not None and (
+                        llm_allows_publish = (
                             feature.state != "FALL"
                             or fall_llm_verifier is None
                             or fall_llm_verifier.is_approved(track_id)
-                        ):
+                        )
+                        fall_only_allows_publish = (
+                            not args.publish_fall_only
+                            or (feature.state == "FALL" and fall_llm_verifier is not None and fall_llm_verifier.is_approved(track_id))
+                        )
+                        if publisher is not None and llm_allows_publish and fall_only_allows_publish:
                             publish_items.append((detection, geometry, feature))
                             held_publish_ids.append(track_id)
 
@@ -1709,23 +1820,47 @@ def main() -> None:
                     except Exception:
                         logging.exception("Cannot publish AI metadata message")
 
-            if args.display:
-                preview = resize_for_preview(frame, preview_w, preview_h)
-                draw_sx = preview.shape[1] / max(1, frame.shape[1])
-                draw_sy = preview.shape[0] / max(1, frame.shape[0])
+            annotated_frame = frame
+            if args.display or output_video_path is not None:
+                annotated_frame = frame.copy()
                 for detection, geometry, feature in display_items:
                     visualizer.draw(
-                        preview,
-                        scale_detection(detection, draw_sx, draw_sy),
-                        scale_geometry(geometry, draw_sx, draw_sy),
+                        annotated_frame,
+                        detection,
+                        geometry,
                         feature,
                     )
+
+            if output_video_path is not None:
+                if output_writer is None:
+                    height, width = annotated_frame.shape[:2]
+                    frame_interval = cap.source_frame_interval()
+                    output_fps = 1.0 / frame_interval if frame_interval else 25.0
+                    output_writer = open_web_video_writer(output_video_path, output_fps, (width, height))
+                    logging.info("Saving annotated video to: %s", output_video_path)
+                output_writer.write(annotated_frame)
+
+            if args.display:
+                preview = resize_for_preview(annotated_frame, preview_w, preview_h)
                 cv2.imshow("Realtime Fall Detection", preview)
                 if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
 
             frame_index += 1
             stats_processed += 1
+            if args.progress_interval > 0 and cap.total_frames() > 0:
+                progress_now = time.perf_counter()
+                if progress_now - last_progress_log_at >= args.progress_interval:
+                    total_frames = cap.total_frames()
+                    completed_frames = min(frame_index, total_frames)
+                    percent = (completed_frames / total_frames) * 100.0
+                    logging.info(
+                        "Video progress: %s/%s frames (%.1f%%)",
+                        completed_frames,
+                        total_frames,
+                        percent,
+                    )
+                    last_progress_log_at = progress_now
             stats_elapsed = time.perf_counter() - stats_start
             if stats_elapsed >= args.log_interval:
                 proc_fps = stats_processed / stats_elapsed
@@ -1751,6 +1886,8 @@ def main() -> None:
         if fall_llm_verifier is not None:
             fall_llm_verifier.close()
         cap.release()
+        if output_writer is not None:
+            output_writer.release()
         if args.display:
             cv2.destroyAllWindows()
 
